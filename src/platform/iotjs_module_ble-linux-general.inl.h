@@ -61,6 +61,17 @@
   iotjs_ble_reqdata_t* req_data = iotjs_ble_reqwrap_data(req_wrap);
 
 
+#define ATT_CID 4
+
+struct sockaddr_l2 {
+  sa_family_t    l2_family;
+  unsigned short l2_psm;
+  bdaddr_t       l2_bdaddr;
+  unsigned short l2_cid;
+  uint8_t        l2_bdaddr_type;
+};
+
+
 int hciDeviceId, hciSocket;
 struct hci_dev_info hciDevInfo;
 char address[18];
@@ -218,6 +229,32 @@ void InitWorker(uv_work_t* work_req) {
 
   get_adapter_state();
   req_data->state = adapterState;
+
+  bdaddr_t daddr;
+
+  if (hci_read_bd_addr(hciSocket, &daddr, 1000) == -1){
+    daddr = *BDADDR_ANY;
+  }
+
+  struct sockaddr_l2 sockAddr;
+
+  memset(&sockAddr, 0, sizeof(sockAddr));
+  sockAddr.l2_family = AF_BLUETOOTH;
+  sockAddr.l2_bdaddr = daddr;
+  sockAddr.l2_cid = htobs(ATT_CID);
+  sockAddr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
+
+  // create socket
+  int serverL2capSock = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+
+  int result = bind(serverL2capSock, (struct sockaddr*)&sockAddr,
+                    sizeof(sockAddr));
+
+  printf("BLE: bind %s\n", (result == -1) ? strerror(errno) : "success");
+
+  result = listen(serverL2capSock, 1);
+
+  printf("BLE: listen %s\n", (result == -1) ? strerror(errno) : "success");
 }
 
 
@@ -273,7 +310,9 @@ void StopAdvertisingWorker(uv_work_t* work_req) {
 
 void SetServicesWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
-  IOTJS_ASSERT(!"Not implemented");
+  // IOTJS_ASSERT(!"Not implemented");
+  
+
 }
 
 

@@ -46,11 +46,89 @@ var util = require('util');
 
 var ble = process.binding(process.binding.ble);
 
-// TODO: Implement PrimaryService
-/* function PrimaryService(options) {
+
+// Primary Service
+function PrimaryService(options) {
   this.uuid = options.uuid;
   this.characteristics = options.characteristics || [];
-} */
+}
+
+util.inherits(PrimaryService, EventEmiter);
+
+
+// Characteristric
+function Characteristic(options) {
+  this.uuid = options.uuid;
+  this.properties = options.properties || [];
+  this.secure = options.secure || [];
+  this.value = options.value || null;
+  this.descriptors = options.descriptors || [];
+
+  if (options.onReadRequest) {
+    this.onReadRequest = options.onReadRequest;
+  }
+
+  if (options.onWriteRequest) {
+    this.onWriteRequest = options.onWriteRequest;
+  }
+
+  if (options.onSubscribe) {
+    this.onSubscribe = options.onSubscribe;
+  }
+
+  if (options.onUnsubscribe) {
+    this.onUnsubscribe = options.onUnsubscribe;
+  }
+
+  if (options.onNotify) {
+    this.onNotify = options.onNotify;
+  }
+
+  if (options.onIndicate) {
+    this.onIndicate = options.onIndicate;
+  }
+
+  this.on('readRequest', this.onReadRequest.bind(this));
+  this.on('writeRequest', this.onWriteRequest.bind(this));
+  this.on('subscribe', this.onSubscribe.bind(this));
+  this.on('unsubscribe', this.onUnsubscribe.bind(this));
+  this.on('notify', this.onNotify.bind(this));
+  this.on('indicate', this.onIndicate.bind(this));
+}
+
+util.inherits(Characteristic, EventEmiter);
+
+Characteristic.prototype.onReadRequest = function(offset, callback) {
+  callback(this.RESULT_UNLIKELY_ERROR, null);
+};
+
+Characteristic.prototype.onWriteRequest = function(data, offset, withoutResponse, callback) {
+  callback(this.RESULT_UNLIKELY_ERROR);
+};
+
+Characteristic.prototype.onSubscribe = function(maxValueSize, updateValueCallback) {
+  this.maxValueSize = maxValueSize;
+  this.updateValueCallback = updateValueCallback;
+};
+
+Characteristic.prototype.onUnsubscribe = function() {
+  this.maxValueSize = null;
+  this.updateValueCallback = null;
+};
+
+Characteristic.prototype.onNotify = function() {
+};
+
+Characteristic.prototype.onIndicate = function() {
+};
+
+
+// Descriptor
+function Descriptor(options) {
+  this.uuid = options.uuid;
+  this.value = options.value || "";
+}
+
 
 function BLE() {
   this.state = 'unknown';
@@ -80,6 +158,8 @@ function BLE() {
       _this.emit('stateChange', state);
     };
   })(this));
+
+  this.setServices([]);
 
   process.on('exit', (function(_this) {
     return function() {
@@ -206,18 +286,178 @@ BLE.prototype.stopAdvertising = function(callback) {
   });
 };
 
-// TODO: Impelemnt setServices function.
 BLE.prototype.setServices = function(services, callback) {
-  ble.setServices(services, function(err) {
+  var deviceName = process.env.BLE_DEVICE_NAME || "BLE-IoT.js";
+
+  // Default Services and Characteristics
+  var allServices = [
+    {
+      uuid: '1800',
+      characteristics: [
+        {
+          uuid: '2a00',
+          properties: ['read'],
+          secure: [],
+          value: deviceName,
+          descriptors: []
+        },
+        {
+          uuid: '2a01',
+          properties: ['read'],
+          secure: [],
+          value: [0x80, 0x00],
+          descriptors: []
+        }
+      ]
+    },
+    {
+      uuid: '1801',
+      characteristics: [
+        {
+          uuid: '2a05',
+          properties: ['indicate'],
+          secure: [],
+          value: [0x00, 0x00, 0x00, 0x00],
+          descriptors: []
+        }
+      ]
+    }
+  ].concat(services);
+
+  this._handles = [];
+
+  var handle = 0;
+  var i;
+  var j;
+
+  for (i = 0; i < allServices.length; i++) {
+    var service = allServices[i];
+
+    handle++;
+    var serviceHandle = handle;
+
+    this._handles[serviceHandle] = {
+      type: 'service',
+      uuid: service.uuid,
+      attribute: service,
+      startHandle: serviceHandle
+    };
+
+    for (j = 0; j < service.characteristics.length; j++) {
+      var characteristic = service.characteristics[j];
+
+      var properties = 0;
+      var secure = 0;
+
+      if (characteristic.properties.indexOf('read') !== -1) {
+        properties |= 0x02;
+
+        if (characteristic.secure.indexOf('read') !== -1) {
+          secure |= 0x02;
+        }
+      }
+
+      if (characteristic.properties.indexOf('writeWithoutResponse') !== -1) {
+        properties |= 0x04;
+
+        if (characteristic.secure.indexOf('writeWithoutResponse') !== -1) {
+          secure |= 0x04;
+        }
+      }
+
+      if (characteristic.properties.indexOf('write') !== -1) {
+        properties |= 0x08;
+
+        if (characteristic.secure.indexOf('write') !== -1) {
+          secure |= 0x08;
+        }
+      }
+
+      if (characteristic.properties.indexOf('notify') !== -1) {
+        properties |= 0x10;
+
+        if (characteristic.secure.indexOf('notify') !== -1) {
+          secure |= 0x10;
+        }
+      }
+
+      if (characteristic.properties.indexOf('indicate') !== -1) {
+        properties |= 0x20;
+
+        if (characteristic.secure.indexOf('indicate') !== -1) {
+          secure |= 0x20;
+        }
+      }
+
+      handle++;
+      var characteristicHandle = handle;
+
+      handle++;
+      var characteristicValueHandle = handle;
+
+      this._handles[characteristicHandle] = {
+        type: 'characteristic',
+        uuid: characteristic.uuid,
+        properties: properties,
+        secure: secure,
+        attribute: characteristic,
+        startHandle: characteristicHandle,
+        valueHandle: characteristicValueHandle
+      };
+
+      this._handles[characteristicValueHandle] = {
+        type: 'characteristicValue',
+        handle: characteristicValueHandle,
+        value: characteristic.value
+      };
+
+      if (properties & 0x30) { // notify or indicate
+        // add client characteristic configuration descriptor
+
+        handle++;
+        var clientCharacteristicConfigurationDescriptorHandle = handle;
+        this._handles[clientCharacteristicConfigurationDescriptorHandle] = {
+          type: 'descriptor',
+          handle: clientCharacteristicConfigurationDescriptorHandle,
+          uuid: '2902',
+          attribute: characteristic,
+          properties: (0x02 | 0x04 | 0x08), // read/write
+          secure: (secure & 0x10) ? (0x02 | 0x04 | 0x08) : 0,
+          value: [0x00, 0x00]
+        };
+      }
+
+      for (var k = 0; k < characteristic.descriptors.length; k++) {
+        var descriptor = characteristic.descriptors[k];
+
+        handle++;
+        var descriptorHandle = handle;
+
+        this._handles[descriptorHandle] = {
+          type: 'descriptor',
+          handle: descriptorHandle,
+          uuid: descriptor.uuid,
+          attribute: descriptor,
+          properties: 0x02, // read only
+          secure: 0x00,
+          value: descriptor.value
+        };
+      }
+    }
+
+    this._handles[serviceHandle].endHandle = handle;
+  }
+
+
+  /*ble.setServices(services, function(err) {
     return process.nextTick(function() {
       return callback(err);
     });
-  });
+  });*/
 };
 
-// TODO: Implement these constructors.
-// BLE.prototype.PrimaryService = PrimaryService;
-// BLE.prototype.Characteristic = characteristic;
-// BLE.prototype.Descriptor = descriptor;
+BLE.prototype.PrimaryService = PrimaryService;
+BLE.prototype.Characteristic = Characteristic;
+BLE.prototype.Descriptor = Descriptor;
 
 module.exports = new BLE();
