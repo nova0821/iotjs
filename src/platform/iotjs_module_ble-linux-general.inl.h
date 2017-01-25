@@ -45,13 +45,10 @@
 #define IOTJS_MODULE_BLE_LINUX_GENERAL_INL_H
 
 #include <errno.h>
-#include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
-
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
 
 #include "module/iotjs_module_ble.h"
 
@@ -60,8 +57,91 @@
   iotjs_ble_reqwrap_t* req_wrap = iotjs_ble_reqwrap_from_request(work_req); \
   iotjs_ble_reqdata_t* req_data = iotjs_ble_reqwrap_data(req_wrap);
 
+#define BTPROTO_L2CAP 0
+#define BTPROTO_HCI   1
+
+#define SOL_HCI       0
+#define HCI_FILTER    2
+
+#define HCIGETDEVLIST _IOR('H', 210, int)
+#define HCIGETDEVINFO _IOR('H', 211, int)
+
+#define HCI_CHANNEL_RAW     0
+#define HCI_CHANNEL_USER    1
+#define HCI_CHANNEL_CONTROL 3
+
+#define HCI_DEV_NONE  0xffff
+
+#define HCI_MAX_DEV 16
 
 #define ATT_CID 4
+
+enum {
+  HCI_UP,
+  HCI_INIT,
+  HCI_RUNNING,
+
+  HCI_PSCAN,
+  HCI_ISCAN,
+  HCI_AUTH,
+  HCI_ENCRYPT,
+  HCI_INQUIRY,
+
+  HCI_RAW,
+};
+
+struct sockaddr_hci {
+  sa_family_t     hci_family;
+  unsigned short  hci_dev;
+  unsigned short  hci_channel;
+};
+
+struct hci_dev_req {
+  uint16_t dev_id;
+  uint32_t dev_opt;
+};
+
+struct hci_dev_list_req {
+  uint16_t dev_num;
+  struct hci_dev_req dev_req[0];
+};
+
+typedef struct {
+  uint8_t b[6];
+} __attribute__((packed)) bdaddr_t;
+
+struct hci_dev_info {
+  uint16_t dev_id;
+  char     name[8];
+
+  bdaddr_t bdaddr;
+
+  uint32_t flags;
+  uint8_t  type;
+
+  uint8_t  features[8];
+
+  uint32_t pkt_type;
+  uint32_t link_policy;
+  uint32_t link_mode;
+
+  uint16_t acl_mtu;
+  uint16_t acl_pkts;
+  uint16_t sco_mtu;
+  uint16_t sco_pkts;
+
+  // hci_dev_stats
+  uint32_t err_rx;
+  uint32_t err_tx;
+  uint32_t cmd_tx;
+  uint32_t evt_rx;
+  uint32_t acl_tx;
+  uint32_t acl_rx;
+  uint32_t sco_tx;
+  uint32_t sco_rx;
+  uint32_t byte_rx;
+  uint32_t byte_tx;
+};
 
 struct sockaddr_l2 {
   sa_family_t    l2_family;
@@ -71,248 +151,195 @@ struct sockaddr_l2 {
   uint8_t        l2_bdaddr_type;
 };
 
+static int _mode;
+static int _socket;
+static int _devId;
+static uv_poll_t _pollHandle;
+static int _l2socket;
+static uint8_t _address[6];
+static uint8_t _addressType;
 
-int hciDeviceId, hciSocket;
-struct hci_dev_info hciDevInfo;
-char address[18];
 
-int previousAdapterState = -1;
-int currentAdapterState;
-BleState adapterState = kBleStatePoweredOff;
+/* int devIdFor(int* pDevId, bool isUp) {
+  int devId = 0; // default
 
-char advertisementDataBuf[256];
-uint8_t advertisementDataLen = 0;
-char scanDataBuf[256];
-uint8_t scanDataLen = 0;
+  if (pDevId == NULL) {
+    struct hci_dev_list_req* dl;
+    struct hci_dev_req* dr;
 
-int hci_le_set_advertising_data(int dd, uint8_t* data, uint8_t length, int to) {
-  struct hci_request rq;
-  le_set_advertising_data_cp data_cp;
-  uint8_t status;
+    dl = (hci_dev_list_req*)calloc(HCI_MAX_DEV * sizeof(*dr) + sizeof(*dl), 1);
+    dr = dl->dev_req;
 
-  memset(&data_cp, 0, sizeof(data_cp));
-  data_cp.length =
-      length <= sizeof(data_cp.data) ? length : sizeof(data_cp.data);
-  memcpy(&data_cp.data, data, data_cp.length);
+    dl->dev_num = HCI_MAX_DEV;
 
-  memset(&rq, 0, sizeof(rq));
-  rq.ogf = OGF_LE_CTL;
-  rq.ocf = OCF_LE_SET_ADVERTISING_DATA;
-  rq.cparam = &data_cp;
-  rq.clen = LE_SET_ADVERTISING_DATA_CP_SIZE;
-  rq.rparam = &status;
-  rq.rlen = 1;
+    if (ioctl(_socket, HCIGETDEVLIST, dl) > -1) {
+      for (int i = 0; i < dl->dev_num; i++, dr++) {
+        bool devUp = dr->dev_opt & (1 << HCI_UP);
+        bool match = isUp ? devUp : !devUp;
 
-  if (hci_send_req(dd, &rq, to) < 0)
-    return -1;
-
-  if (status) {
-    errno = EIO;
-    return -1;
-  }
-
-  return 0;
-}
-
-int hci_le_set_scan_response_data(int dd, uint8_t* data, uint8_t length,
-                                  int to) {
-  struct hci_request rq;
-  le_set_scan_response_data_cp data_cp;
-  uint8_t status;
-
-  memset(&data_cp, 0, sizeof(data_cp));
-  data_cp.length =
-      length <= sizeof(data_cp.data) ? length : sizeof(data_cp.data);
-  memcpy(&data_cp.data, data, data_cp.length);
-
-  memset(&rq, 0, sizeof(rq));
-  rq.ogf = OGF_LE_CTL;
-  rq.ocf = OCF_LE_SET_SCAN_RESPONSE_DATA;
-  rq.cparam = &data_cp;
-  rq.clen = LE_SET_SCAN_RESPONSE_DATA_CP_SIZE;
-  rq.rparam = &status;
-  rq.rlen = 1;
-
-  if (hci_send_req(dd, &rq, to) < 0)
-    return -1;
-
-  if (status) {
-    errno = EIO;
-    return -1;
-  }
-
-  return 0;
-}
-
-// Set advertising interval to 100 ms
-// Note: 0x00A0 * 0.625ms = 100ms
-int hci_le_set_advertising_parameters(int dd, int to) {
-  struct hci_request rq;
-  le_set_advertising_parameters_cp adv_params_cp;
-  uint8_t status;
-
-  memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-  adv_params_cp.min_interval = htobs(0x00A0);
-  adv_params_cp.max_interval = htobs(0x00A0);
-  adv_params_cp.chan_map = 7;
-
-  memset(&rq, 0, sizeof(rq));
-  rq.ogf = OGF_LE_CTL;
-  rq.ocf = OCF_LE_SET_ADVERTISING_PARAMETERS;
-  rq.cparam = &adv_params_cp;
-  rq.clen = LE_SET_ADVERTISING_PARAMETERS_CP_SIZE;
-  rq.rparam = &status;
-  rq.rlen = 1;
-
-  if (hci_send_req(dd, &rq, to) < 0)
-    return -1;
-
-  if (status) {
-    errno = EIO;
-    return -1;
-  }
-
-  return 0;
-}
-
-void get_adapter_state() {
-  // get HCI dev info for adapter state
-  ioctl(hciSocket, HCIGETDEVINFO, (void*)&hciDevInfo);
-  currentAdapterState = hci_test_bit(HCI_UP, &hciDevInfo.flags);
-
-  if (previousAdapterState != currentAdapterState) {
-    previousAdapterState = currentAdapterState;
-
-    if (!currentAdapterState) {
-      adapterState = kBleStatePoweredOff;
-    } else {
-      hci_le_set_advertise_enable(hciSocket, 0, 1000);
-      hci_le_set_advertise_enable(hciSocket, 1, 1000);
-
-      if (hci_le_set_advertise_enable(hciSocket, 0, 1000) == -1) {
-        if (EPERM == errno) {
-          adapterState = kBleStateUnauthorized;
-        } else if (EIO == errno) {
-          adapterState = kBleStateUnsupported;
-        } else {
-          adapterState = kBleStateUnknown;
+        if (match) {
+          // choose the first device that is match
+          // later on, it would be good to also HCIGETDEVINFO and check the HCI_RAW flag
+          devId = dr->dev_id;
+          break;
         }
-      } else {
-        adapterState = kBleStatePoweredOn;
       }
     }
-    ba2str(&hciDevInfo.bdaddr, address);
+
+    free(dl);
+  } else {
+    devId = *pDevId;
+  }
+
+  return devId;
+} */
+
+int bindRaw(int* devId) {
+  struct sockaddr_hci a;
+  struct hci_dev_info di;
+
+  memset(&a, 0, sizeof(a));
+  a.hci_family = AF_BLUETOOTH;
+  a.hci_dev = 0; //devIdFor(devId, true);
+  a.hci_channel = HCI_CHANNEL_RAW;
+
+  _devId = a.hci_dev;
+  _mode = HCI_CHANNEL_RAW;
+
+  bind(_socket, (struct sockaddr *) &a, sizeof(a));
+
+  // get the local address and address type
+  memset(&di, 0x00, sizeof(di));
+  di.dev_id = _devId;
+  memset(_address, 0, sizeof(_address));
+  _addressType = 0;
+
+  if (ioctl(_socket, HCIGETDEVINFO, (void *)&di) > -1) {
+    memcpy(_address, &di.bdaddr, sizeof(di.bdaddr));
+    _addressType = di.type;
+
+    if (_addressType == 3) {
+      // 3 is a weird type, use 1 (public) instead
+      _addressType = 1;
+    }
+  }
+
+  return _devId;
+}
+
+
+int bindUser(int* devId) {
+  struct sockaddr_hci a;
+
+  memset(&a, 0, sizeof(a));
+  a.hci_family = AF_BLUETOOTH;
+  a.hci_dev = 0; //devIdFor(devId, false);
+  a.hci_channel = HCI_CHANNEL_USER;
+
+  _devId = a.hci_dev;
+  _mode = HCI_CHANNEL_USER;
+
+  bind(_socket, (struct sockaddr *) &a, sizeof(a));
+
+  return _devId;
+}
+
+
+bool isDevUp() {
+  struct hci_dev_info di;
+  bool isUp = false;
+
+  memset(&di, 0x00, sizeof(di));
+  di.dev_id = _devId;
+
+  if (ioctl(_socket, HCIGETDEVINFO, (void *)&di) > -1) {
+    isUp = (di.flags & (1 << HCI_UP)) != 0;
+  }
+
+  return isUp;
+}
+
+
+void setFilter(char* data, int length) {
+  if (setsockopt(_socket, SOL_HCI, HCI_FILTER, data, length) < 0) {
+    //this->emitErrnoError();
+    printf("ERRROR\n");
   }
 }
+
+
+void poll_cb(uv_poll_t* req, int status, int events) {
+  printf("poll is called.\n");
+
+  int length = 0;
+  char data[1024];
+
+  length = read(_socket, data, sizeof(data));
+
+  if (length > 0) {
+    if (_mode == HCI_CHANNEL_RAW) {
+      // kernelDisconnectWorkArounds(length, data);
+    }
+
+    /* Local<Value> argv[2] = {
+      Nan::New("data").ToLocalChecked(),
+      Nan::CopyBuffer(data, length).ToLocalChecked()
+    }; 
+
+    Nan::MakeCallback(Nan::New<Object>(this->This), Nan::New("emit").ToLocalChecked(), 2, argv);*/
+  }
+}
+
+
+void start() {
+  uv_poll_start(&_pollHandle, UV_READABLE, poll_cb);
+}
+
+
+void stop() {
+  uv_poll_stop(&_pollHandle);
+}
+
+
+void write_(char* data, int length) {
+  if (write(_socket, data, length) < 0) {
+    // emitErrnoError();
+    printf("ERROR\n");
+  }
+}
+
 
 void RunBleLoopWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
-
-  get_adapter_state();
-  req_data->state = adapterState;
 }
 
 
 void InitWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
 
-  memset(&hciDevInfo, 0x00, sizeof(hciDevInfo));
+  _socket = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, BTPROTO_HCI);
 
-  hciDeviceId = hci_get_route(NULL);
-  hciSocket = hci_open_dev(hciDeviceId);
-  hciDevInfo.dev_id = hciDeviceId;
-
-  if (hciSocket < 0) {
-    req_data->state = kBleStateUnknown;
-    return;
-  }
-
-  get_adapter_state();
-  req_data->state = adapterState;
-
-  bdaddr_t daddr;
-
-  if (hci_read_bd_addr(hciSocket, &daddr, 1000) == -1){
-    daddr = *BDADDR_ANY;
-  }
-
-  struct sockaddr_l2 sockAddr;
-
-  memset(&sockAddr, 0, sizeof(sockAddr));
-  sockAddr.l2_family = AF_BLUETOOTH;
-  sockAddr.l2_bdaddr = daddr;
-  sockAddr.l2_cid = htobs(ATT_CID);
-  sockAddr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
-
-  // create socket
-  int serverL2capSock = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-
-  int result = bind(serverL2capSock, (struct sockaddr*)&sockAddr,
-                    sizeof(sockAddr));
-
-  printf("BLE: bind %s\n", (result == -1) ? strerror(errno) : "success");
-
-  result = listen(serverL2capSock, 1);
-
-  printf("BLE: listen %s\n", (result == -1) ? strerror(errno) : "success");
+  uv_loop_t* loop = iotjs_environment_loop(iotjs_environment_get());
+  uv_poll_init(loop, &_pollHandle, _socket);
 }
 
 
 void StartAdvertisingWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
 
-  advertisementDataLen = req_data->advertisement_len;
-  for (int i = 0; i < advertisementDataLen; i++) {
-    advertisementDataBuf[i] = req_data->advertisement_data[i];
-  }
-
-  scanDataLen = req_data->scan_len;
-  for (int i = 0; i < scanDataLen; i++) {
-    scanDataBuf[i] = req_data->scan_data[i];
-  }
-
-  // stop advertising
-  hci_le_set_advertise_enable(hciSocket, 0, 1000);
-
-  // set scan data
-  hci_le_set_scan_response_data(hciSocket, (uint8_t*)&scanDataBuf, scanDataLen,
-                                1000);
-
-  // set advertisement data
-  hci_le_set_advertising_data(hciSocket, (uint8_t*)&advertisementDataBuf,
-                              advertisementDataLen, 1000);
-
-  // set advertisement parameters,
-  // mostly to set the advertising interval to 100ms
-  hci_le_set_advertising_parameters(hciSocket, 1000);
-
-  // start advertising
-  hci_le_set_advertise_enable(hciSocket, 1, 1000);
-
-  // set scan data
-  hci_le_set_scan_response_data(hciSocket, (uint8_t*)&scanDataBuf, scanDataLen,
-                                1000);
-
-  // set advertisement data
-  hci_le_set_advertising_data(hciSocket, (uint8_t*)&advertisementDataBuf,
-                              advertisementDataLen, 1000);
+  start();
 }
 
 
 void StopAdvertisingWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
 
-  // stop advertising
-  hci_le_set_advertise_enable(hciSocket, 0, 1000);
-  close(hciSocket);
+  stop();
 }
 
 
 void SetServicesWorker(uv_work_t* work_req) {
   BLE_WORKER_INIT_TEMPLATE;
-  // IOTJS_ASSERT(!"Not implemented");
-  
-
 }
 
 
